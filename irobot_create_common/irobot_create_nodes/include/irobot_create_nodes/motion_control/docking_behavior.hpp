@@ -11,6 +11,7 @@
 
 #include "irobot_create_msgs/action/dock.hpp"
 #include "irobot_create_msgs/action/undock.hpp"
+#include "irobot_create_msgs/action/square_dock.hpp"
 #include "irobot_create_msgs/msg/dock_status.hpp"
 #include "irobot_create_nodes/motion_control/behaviors_scheduler.hpp"
 #include "irobot_create_nodes/motion_control/simple_goal_controller.hpp"
@@ -80,13 +81,32 @@ private:
     const std::shared_ptr<
       rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::Undock>> goal_handle);
 
+  rclcpp_action::GoalResponse handle_square_dock_goal(
+    const rclcpp_action::GoalUUID & uuid,
+    std::shared_ptr<const irobot_create_msgs::action::SquareDock::Goal> goal);
+
+  rclcpp_action::CancelResponse handle_square_dock_cancel(
+    const std::shared_ptr<
+      rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle);
+
+  void handle_square_dock_accepted(
+    const std::shared_ptr<
+      rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle);
+
   BehaviorsScheduler::optional_output_t execute_undock(
     const std::shared_ptr<
       rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::Undock>> goal_handle,
     const RobotState & current_state);
 
+  BehaviorsScheduler::optional_output_t execute_square_dock(
+    const std::shared_ptr<
+      rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle,
+    const RobotState & current_state);
+
   rclcpp_action::Server<irobot_create_msgs::action::Dock>::SharedPtr docking_action_server_;
   rclcpp_action::Server<irobot_create_msgs::action::Undock>::SharedPtr undocking_action_server_;
+
+  rclcpp_action::Server<irobot_create_msgs::action::SquareDock>::SharedPtr square_dock_action_server_;
 
   rclcpp::Subscription<irobot_create_msgs::msg::DockStatus>::SharedPtr dock_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr robot_pose_sub_;

@@ -2,6 +2,7 @@
 // @author Justin Kearns (jkearns@irobot.com)
 
 #include <irobot_create_nodes/motion_control/docking_behavior.hpp>
+#include "angles/angles.h"
 
 #include <memory>
 
@@ -19,7 +20,7 @@ DockingBehavior::DockingBehavior(
   std::shared_ptr<BehaviorsScheduler> behavior_scheduler)
 : clock_(node_clock_interface->get_clock()),
   logger_(node_logging_interface->get_logger()),
-  max_action_runtime_(rclcpp::Duration(std::chrono::seconds(30)))
+  max_action_runtime_(rclcpp::Duration(std::chrono::seconds(60)))
 {
   behavior_scheduler_ = behavior_scheduler;
   last_feedback_time_ = clock_->now();
@@ -61,6 +62,17 @@ DockingBehavior::DockingBehavior(
     std::bind(&DockingBehavior::handle_undock_goal, this, _1, _2),
     std::bind(&DockingBehavior::handle_undock_cancel, this, _1),
     std::bind(&DockingBehavior::handle_undock_accepted, this, _1));
+
+  square_dock_action_server_ = rclcpp_action::create_server<irobot_create_msgs::action::SquareDock>(
+    node_base_interface,
+    node_clock_interface,
+    node_logging_interface,
+    node_waitables_interface,
+    "square_dock",
+    std::bind(&DockingBehavior::handle_square_dock_goal, this, _1, _2),
+    std::bind(&DockingBehavior::handle_square_dock_cancel, this, _1),
+    std::bind(&DockingBehavior::handle_square_dock_accepted, this, _1));
+
   // Give poses default value, will be over-written by subscriptions
   last_robot_pose_.setIdentity();
   last_dock_pose_.setIdentity();
@@ -246,7 +258,7 @@ rclcpp_action::GoalResponse DockingBehavior::handle_undock_goal(
 
 rclcpp_action::CancelResponse DockingBehavior::handle_undock_cancel(
   const std::shared_ptr<
-    rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::Undock>>/*goal_handle*/)
+    rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::Undock>> /*goal_handle*/)
 {
   RCLCPP_INFO(logger_, "Received request to cancel undock goal");
   return rclcpp_action::CancelResponse::ACCEPT;
@@ -380,6 +392,167 @@ void DockingBehavior::calibrate_docked_distance_offset(
   last_docked_distance_offset_ = std::hypot(pos_diff.getX(), pos_diff.getY());
   calibrated_offset_ = true;
   RCLCPP_DEBUG(logger_, "Setting robot dock offset to %f", last_docked_distance_offset_);
+}
+
+rclcpp_action::GoalResponse DockingBehavior::handle_square_dock_goal(
+    const rclcpp_action::GoalUUID & /*uuid*/,
+    std::shared_ptr<const irobot_create_msgs::action::SquareDock::Goal> /*goal*/) {
+  RCLCPP_INFO(logger_, "Received new dock servo goal");
+
+  if (!docking_behavior_is_done()) {
+    RCLCPP_WARN(logger_, "A docking behavior is already running, reject");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  if (is_docked_) {
+    RCLCPP_WARN(logger_, "Robot in dock, reject");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  if (!sees_dock_) {
+    RCLCPP_WARN(logger_, "Robot doesn't see dock, reject");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  RCLCPP_INFO(logger_, "Goal accepted");
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse DockingBehavior::handle_square_dock_cancel(
+    const std::shared_ptr<
+      rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle) {
+  return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+
+void DockingBehavior::handle_square_dock_accepted(
+    const std::shared_ptr<rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle) {
+  // Create new Docking state machine
+  running_dock_action_ = true;
+  action_start_time_ = clock_->now();
+
+  // Generate point offset from dock facing dock then point at dock
+  SimpleGoalController::CmdPath dock_path;
+  tf2::Transform robot_pose(tf2::Transform::getIdentity());
+  {
+    const std::lock_guard<std::mutex> lock(robot_pose_mutex_);
+    robot_pose = last_robot_pose_;
+  }
+  tf2::Transform dock_pose(tf2::Transform::getIdentity());
+  {
+    const std::lock_guard<std::mutex> lock(dock_pose_mutex_);
+    dock_pose = last_dock_pose_;
+  }
+
+  //TODO! check if tf2::Transform has a default constructor for this
+  std::array square_points = {
+	  tf2::Transform::getIdentity(),
+	  tf2::Transform::getIdentity(),
+	  tf2::Transform::getIdentity(),
+	  tf2::Transform::getIdentity(),
+	  tf2::Transform::getIdentity(),
+  };
+
+  // Set the points along which to walk...
+  square_points[0].setOrigin(dock_pose * tf2::Vector3( 0.5,  0.0,  0.0));
+  square_points[1].setOrigin(dock_pose * tf2::Vector3( 0.0,  0.5,  0.0));
+  square_points[2].setOrigin(dock_pose * tf2::Vector3(-0.5,  0.0,  0.5));
+  square_points[3].setOrigin(dock_pose * tf2::Vector3( 0.0, -0.5,  0.0));
+  square_points[4].setOrigin(dock_pose * tf2::Vector3( 0.5,  0.0,  0.0)); // End up back at starting point
+
+  // Update rotations
+  {
+    tf2::Vector3 from = robot_pose.getOrigin();
+    for (auto & to_tf : square_points) {
+      tf2::Quaternion rotation;
+      tf2::Vector3 to = to_tf.getOrigin();
+      tf2::Vector3 delta = to - from;
+      double theta = atan2(delta.getY(), delta.getX());
+
+      rotation.setRPY(0,0,angles::normalize_angle(theta));
+      to_tf.setRotation(rotation);
+      from = to;
+    }
+  }
+
+  for (auto pt : square_points) {
+    dock_path.emplace_back(pt, 0.02, false);
+  }
+
+  goal_controller_.initialize_goal(dock_path, M_PI / 4.0, 0.3);
+
+  BehaviorsScheduler::BehaviorsData data;
+  data.run_func = std::bind(&DockingBehavior::execute_square_dock, this, goal_handle, _1);
+  data.is_done_func = std::bind(&DockingBehavior::docking_behavior_is_done, this);
+  data.stop_on_new_behavior = false;
+  data.apply_backup_limits = false;
+
+  const bool ret = behavior_scheduler_->set_behavior(data);
+  if (!ret) {
+    // for some reason we couldn't set the new behavior, treat this as a goal being cancelled
+    RCLCPP_WARN(logger_, "Dock Servo behavior failed to start");
+    auto result = std::make_shared<irobot_create_msgs::action::SquareDock::Result>();
+    result->is_docked = is_docked_;
+    goal_handle->abort(result);
+    running_dock_action_ = false;
+  }
+  last_feedback_time_ = clock_->now();
+}
+
+BehaviorsScheduler::optional_output_t DockingBehavior::execute_square_dock(
+  const std::shared_ptr<
+    rclcpp_action::ServerGoalHandle<irobot_create_msgs::action::SquareDock>> goal_handle,
+  const RobotState & /*current_state*/)
+{
+  BehaviorsScheduler::optional_output_t servo_cmd;
+  // Handle if goal is cancelling
+  if (goal_handle->is_canceling()) {
+    auto result = std::make_shared<irobot_create_msgs::action::SquareDock::Result>();
+    result->is_docked = is_docked_;
+    goal_handle->canceled(result);
+    goal_controller_.reset();
+    running_dock_action_ = false;
+    return servo_cmd;
+  }
+
+  bool exceeded_runtime = false;
+  if (clock_->now() - action_start_time_ > max_action_runtime_) {
+    RCLCPP_INFO(logger_, "Dock Servo Goal Exceeded Runtime");
+    exceeded_runtime = true;
+  }
+  // Get next command
+  tf2::Transform robot_pose(tf2::Transform::getIdentity());
+  {
+    const std::lock_guard<std::mutex> lock(robot_pose_mutex_);
+    robot_pose = last_robot_pose_;
+  }
+  servo_cmd = goal_controller_.get_velocity_for_position(robot_pose);
+  if (!servo_cmd || exceeded_runtime ) {
+    if (!exceeded_runtime) {
+      auto result = std::make_shared<irobot_create_msgs::action::SquareDock::Result>();
+      result->is_docked = is_docked_;
+      RCLCPP_INFO(logger_, "Square Dock Goal Succeeded");//TODO? This would be a good place to check if we are at the desired destination
+      goal_handle->succeed(result);
+    } else {
+      auto result = std::make_shared<irobot_create_msgs::action::SquareDock::Result>();
+      result->is_docked = is_docked_;
+      RCLCPP_INFO(logger_, "Squaring took to long: timeout");//TODO? This would be a good place to check if we are at the desired destination
+      goal_handle->abort(result);
+    }
+    goal_controller_.reset();
+    running_dock_action_ = false;
+    return servo_cmd;
+  }
+
+  rclcpp::Time current_time = clock_->now();
+  auto time_since_feedback = current_time - last_feedback_time_;
+  if (time_since_feedback > report_feedback_interval_) {
+    // Publish feedback
+    auto feedback = std::make_shared<irobot_create_msgs::action::SquareDock::Feedback>();
+    feedback->sees_dock = sees_dock_;
+    goal_handle->publish_feedback(feedback);
+    last_feedback_time_ = current_time;
+  }
+
+  return servo_cmd;
 }
 
 }  // namespace irobot_create_nodes
